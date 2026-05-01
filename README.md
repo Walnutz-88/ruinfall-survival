@@ -8,7 +8,8 @@ A browser-based 3D zombie survival prototype: one ruined city, scavenging, base 
 - Looting for food, water, ammo, medkits, and a rifle unlock.
 - First-person combat (pistol and rifle), hunger, thirst, and zombie threats.
 - Inventory panel and on-screen prompts for doors and loot.
-- Heavier rendering path in-engine: ACES tone mapping, image-based lighting (`RoomEnvironment`), soft shadows, bloom, and PBR-style materials (procedural textures; swap in glTF assets for film-grade detail).
+- Heavier rendering path in-engine: ACES tone mapping, image-based lighting (`RoomEnvironment`), optional **Poly Haven HDRI** upgrade over the network, soft shadows, bloom, and PBR-style materials.
+- **First-person weapon view-models** (pistol + rifle) with sway and recoil; optional **`public/models/rifle.glb`** replaces the procedural rifle in-hand.
 
 ## Controls
 - `WASD`: move
@@ -23,7 +24,9 @@ A browser-based 3D zombie survival prototype: one ruined city, scavenging, base 
 - `Q`: swap weapon (after rifle is found)
 
 ## Higher fidelity assets
-This repo uses procedural textures so it runs with zero downloads. For photoreal guns and architecture, add glTF/GLB models under `public/models/` and load them with `GLTFLoader` (see Three.js docs). HDR outdoor probes can replace `RoomEnvironment` via `RGBELoader` for even more realistic lighting.
+- **HDRI**: On first run with network access, the game tries to load a CC0 outdoor HDR from Poly Haven and use it as `scene.environment`. Offline play keeps the built-in studio probe.
+- **Rifle model**: Drop a `rifle.glb` into `public/models/` (same rig works best if oriented along −Z). The first-person rifle view-model will swap to your mesh automatically.
+- For full city geometry, add more glTF under `public/models/` and instance them in `buildCityRuins` / `createEnterableBuilding`.
 
 ## Run on MacBook Pro
 1. `npm install`

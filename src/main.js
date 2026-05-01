@@ -5,6 +5,8 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
+import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 const WORLD_SIZE = 420;
 const WORLD_SEGMENTS = 210;
@@ -28,6 +30,16 @@ const LOOT_LABELS = {
   rifle: "Assault rifle"
 };
 
+/** CC0 outdoor HDRI (Poly Haven). Replaces the studio probe when load succeeds. */
+const POLYHAVEN_HDRI_URL =
+  "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/industrial_sunset_02_1k.hdr";
+
+const assets = {
+  /** Optional first-person rifle; filled if `public/models/rifle.glb` exists. */
+  rifleGltf: null,
+  usedHdrEnvironment: false
+};
+
 let scene;
 let camera;
 let renderer;
@@ -46,6 +58,10 @@ const baseGroup = new THREE.Group();
 const lootGroup = new THREE.Group();
 const cityGroup = new THREE.Group();
 
+/** First-person weapon rigs parented to the camera (cheap “AAA” readability). */
+let weaponViewPistol;
+let weaponViewRifle;
+
 const keys = { w: false, a: false, s: false, d: false, shift: false };
 const player = {
   position: new THREE.Vector3(0, PLAYER_HEIGHT + 5, 0),
@@ -58,6 +74,8 @@ const player = {
   grounded: false,
   attackCooldown: 0,
   shootCooldown: 0,
+  /** Drives view-model recoil; decays each frame. */
+  weaponKick: 0,
   inventory: { food: 1, water: 1, medkit: 0, ammo: 30 },
   weapon: "pistol",
   hasRifle: false,
@@ -93,6 +111,8 @@ const ui = {
 };
 
 init();
+void upgradeEnvironmentWithHdr();
+void tryLoadOptionalRifleGltf();
 animate();
 
 function init() {
@@ -120,7 +140,7 @@ function init() {
   // Required for physically correct RectAreaLight contribution on MeshStandardMaterial.
   RectAreaLightUniformsLib.init();
 
-  setupImageBasedLighting();
+  applyRoomEnvironmentFallback();
 
   const hemiLight = new THREE.HemisphereLight(0xa8b8d4, 0x1a1c22, 0.5);
   scene.add(hemiLight);
@@ -140,6 +160,9 @@ function init() {
 
   setupPostProcess();
 
+  buildWeaponViewModels();
+  camera.add(weaponViewPistol, weaponViewRifle);
+
   generateWorld(game.seed);
   spawnZombies(40);
   hookInput();
@@ -155,14 +178,182 @@ function init() {
 }
 
 /**
- * Image-based lighting from a neutral room probe: gives PBR materials believable
- * reflections without shipping HDR files. For film-grade fidelity, swap in an HDR via RGBELoader.
+ * Studio-style neutral probe so the first frames look correct even before HDR/network loads.
  */
-function setupImageBasedLighting() {
+function applyRoomEnvironmentFallback() {
   const pmrem = new THREE.PMREMGenerator(renderer);
   const env = new RoomEnvironment();
   scene.environment = pmrem.fromScene(env, 0.04).texture;
   pmrem.dispose();
+}
+
+/**
+ * Async upgrade: outdoor HDRI for believable metal/roughness on ruins. Keeps the studio probe if offline.
+ */
+async function upgradeEnvironmentWithHdr() {
+  try {
+    const rgbeLoader = new RGBELoader();
+    const hdrTexture = await rgbeLoader.loadAsync(POLYHAVEN_HDRI_URL);
+    hdrTexture.mapping = THREE.EquirectangularReflectionMapping;
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const envMap = pmrem.fromEquirectangular(hdrTexture).texture;
+    pmrem.dispose();
+    hdrTexture.dispose();
+    scene.environment = envMap;
+    renderer.toneMappingExposure = 0.92;
+    assets.usedHdrEnvironment = true;
+  } catch {
+    /* keep RoomEnvironment fallback */
+  }
+}
+
+function tryLoadOptionalRifleGltf() {
+  const loader = new GLTFLoader();
+  loader.load(
+    "/models/rifle.glb",
+    (gltf) => {
+      assets.rifleGltf = gltf.scene;
+      rebuildRifleViewModelFromGltf();
+    },
+    undefined,
+    () => {
+      /* optional asset not present */
+    }
+  );
+}
+
+function rebuildRifleViewModelFromGltf() {
+  if (!weaponViewRifle || !assets.rifleGltf) return;
+  weaponViewRifle.clear();
+  const inst = assets.rifleGltf.clone(true);
+  inst.traverse((obj) => {
+    if (obj.isMesh) {
+      obj.castShadow = false;
+      obj.receiveShadow = false;
+    }
+  });
+  const box = new THREE.Box3().setFromObject(inst);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z, 1e-4);
+  inst.scale.setScalar(0.44 / maxDim);
+  inst.rotation.set(0.05, Math.PI + 0.12, 0);
+  inst.position.set(0, -0.05, 0);
+  weaponViewRifle.add(inst);
+}
+
+function buildWeaponViewModels() {
+  weaponViewPistol = buildViewModelPistol();
+  weaponViewPistol.position.set(0.3, -0.24, -0.48);
+  weaponViewPistol.rotation.set(0.08, 0.18, 0);
+  weaponViewPistol.visible = false;
+
+  weaponViewRifle = buildViewModelRifle();
+  weaponViewRifle.position.set(0.2, -0.2, -0.72);
+  weaponViewRifle.rotation.set(0.04, 0.14, 0);
+  weaponViewRifle.visible = false;
+}
+
+function syncWeaponViewModels() {
+  if (!weaponViewPistol || !weaponViewRifle) return;
+  const active = game.started && !game.over;
+  weaponViewPistol.visible = active && player.weapon === "pistol";
+  weaponViewRifle.visible = active && player.hasRifle && player.weapon === "rifle";
+}
+
+function buildViewModelPistol() {
+  const g = new THREE.Group();
+  const polymer = new THREE.MeshStandardMaterial({
+    color: 0x2a2a2a,
+    roughness: 0.45,
+    metalness: 0.35,
+    envMapIntensity: 1.1
+  });
+  const steel = new THREE.MeshStandardMaterial({
+    color: 0x6f767c,
+    roughness: 0.28,
+    metalness: 0.82,
+    envMapIntensity: 1.2
+  });
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.1, 0.12), polymer);
+  grip.position.set(0, -0.04, 0.02);
+  const slide = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.22), steel);
+  slide.position.set(0, 0.02, -0.06);
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.16, 10), steel);
+  barrel.rotation.x = Math.PI / 2;
+  barrel.position.set(0, 0.04, -0.22);
+  g.add(grip, slide, barrel);
+  return g;
+}
+
+function buildViewModelRifle() {
+  const g = new THREE.Group();
+  const receiver = new THREE.MeshStandardMaterial({
+    color: 0x3a3f42,
+    roughness: 0.35,
+    metalness: 0.78,
+    envMapIntensity: 1.15
+  });
+  const polymer = new THREE.MeshStandardMaterial({
+    color: 0x1f211f,
+    roughness: 0.55,
+    metalness: 0.2,
+    envMapIntensity: 0.9
+  });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, 0.55), receiver);
+  body.position.set(0, 0, -0.12);
+  const handguard = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.1, 0.32), polymer);
+  handguard.position.set(0, -0.02, -0.42);
+  const stock = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.1, 0.22), polymer);
+  stock.position.set(0, -0.01, 0.18);
+  const mag = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.16, 0.08), polymer);
+  mag.position.set(0, -0.12, -0.05);
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.025, 0.38, 10), receiver);
+  barrel.rotation.x = Math.PI / 2;
+  barrel.position.set(0, 0.04, -0.62);
+  g.add(body, handguard, stock, mag, barrel);
+  return g;
+}
+
+function buildGroundRiflePickup() {
+  const g = new THREE.Group();
+  const receiver = new THREE.MeshStandardMaterial({
+    color: 0x3d4347,
+    roughness: 0.38,
+    metalness: 0.75,
+    envMapIntensity: 0.95
+  });
+  const polymer = new THREE.MeshStandardMaterial({
+    color: 0x252824,
+    roughness: 0.6,
+    metalness: 0.18,
+    envMapIntensity: 0.75
+  });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.11, 0.5), receiver);
+  const guard = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.09, 0.28), polymer);
+  guard.position.set(0, 0, -0.32);
+  const stock = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.09, 0.18), polymer);
+  stock.position.set(0, 0, 0.28);
+  const mag = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.14, 0.07), polymer);
+  mag.position.set(0, -0.1, 0);
+  for (const m of [body, guard, stock, mag]) {
+    m.castShadow = true;
+    m.receiveShadow = true;
+  }
+  g.add(body, guard, stock, mag);
+  g.rotation.set(Math.PI / 2, 0.35, 0.2);
+  return g;
+}
+
+function disposeLootObject(root) {
+  root.traverse((obj) => {
+    if (obj.isMesh) {
+      obj.geometry?.dispose();
+      const mat = obj.material;
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+      else mat?.dispose();
+    }
+  });
 }
 
 /** Heavier visual pipeline: bloom + correct output transform. Tune bloom for "dirty lens" city haze. */
@@ -641,19 +832,26 @@ function spawnInteriorLoot(seed) {
 }
 
 function addLootPickup(position, type, colorHex) {
-  const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(type === "rifle" ? 1.1 : 0.6, 0.35, type === "rifle" ? 0.2 : 0.6),
-    new THREE.MeshStandardMaterial({
-      color: colorHex,
-      roughness: 0.65,
-      metalness: type === "rifle" ? 0.55 : 0.12,
-      envMapIntensity: 0.6
-    })
-  );
-  mesh.position.copy(position);
-  mesh.castShadow = true;
-  lootGroup.add(mesh);
-  game.loot.push({ mesh, type, picked: false, label: LOOT_LABELS[type] });
+  let root;
+  if (type === "rifle") {
+    root = buildGroundRiflePickup();
+    root.position.copy(position);
+  } else {
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.6, 0.35, 0.6),
+      new THREE.MeshStandardMaterial({
+        color: colorHex,
+        roughness: 0.65,
+        metalness: 0.12,
+        envMapIntensity: 0.6
+      })
+    );
+    mesh.position.copy(position);
+    mesh.castShadow = true;
+    root = mesh;
+  }
+  lootGroup.add(root);
+  game.loot.push({ mesh: root, type, picked: false, label: LOOT_LABELS[type] });
 }
 
 function spawnZombies(count) {
@@ -691,6 +889,7 @@ function spawnZombies(count) {
 function hookInput() {
   document.addEventListener("pointerlockchange", () => {
     game.started = document.pointerLockElement === renderer.domElement;
+    syncWeaponViewModels();
   });
 
   window.addEventListener("mousemove", (ev) => {
@@ -799,14 +998,14 @@ function tryPickupLoot() {
   const item = ctx.item;
   item.picked = true;
   lootGroup.remove(item.mesh);
-  item.mesh.geometry.dispose();
-  item.mesh.material.dispose();
+  disposeLootObject(item.mesh);
   if (item.type === "food") player.inventory.food += 1;
   if (item.type === "water") player.inventory.water += 1;
   if (item.type === "medkit") player.inventory.medkit += 1;
   if (item.type === "ammo") player.inventory.ammo += 12;
   if (item.type === "rifle") player.hasRifle = true;
   updateInventoryPanel();
+  syncWeaponViewModels();
 }
 
 function updateInteractionPrompt() {
@@ -895,12 +1094,14 @@ function swapWeapon() {
   if (!player.hasRifle) return;
   player.weapon = player.weapon === "pistol" ? "rifle" : "pistol";
   updateInventoryPanel();
+  syncWeaponViewModels();
 }
 
 function shootWeapon() {
   if (player.shootCooldown > 0 || player.inventory.ammo <= 0 || game.over) return;
   player.inventory.ammo -= 1;
   player.shootCooldown = player.weapon === "rifle" ? 0.09 : 0.28;
+  player.weaponKick = Math.min(1, player.weaponKick + (player.weapon === "rifle" ? 0.2 : 0.32));
   updateInventoryPanel();
   raycaster.setFromCamera(mouseCenter, camera);
   const targets = game.zombies.filter((z) => z.hp > 0).map((z) => z.mesh);
@@ -1037,6 +1238,18 @@ function animate() {
     updateZombies(dt);
     updateSurvival(dt);
   }
+
+  const t = clock.elapsedTime;
+  const sway = Math.sin(t * 5.5) * 0.028;
+  player.weaponKick = THREE.MathUtils.lerp(player.weaponKick, 0, dt * 16);
+  syncWeaponViewModels();
+  if (weaponViewPistol?.visible) {
+    weaponViewPistol.rotation.set(0.08 + player.weaponKick * 0.85, 0.18 + sway * 0.35, sway);
+  }
+  if (weaponViewRifle?.visible) {
+    weaponViewRifle.rotation.set(0.04 + player.weaponKick * 0.5, 0.14 + sway * 0.22, sway * 0.85);
+  }
+
   updateUI();
   updateInteractionPrompt();
   composer.render();
