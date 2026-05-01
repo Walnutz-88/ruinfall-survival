@@ -9,9 +9,8 @@
   <body>
     <div id="ui">
       <h1>Ruinfall Survival</h1>
-      <p>WASD move, Mouse look, Space jump, Shift sprint</p>
-      <p>Left click fire · B wall · R remove · Q swap weapon</p>
-      <p>1 food · 2 water · 3 medkit · E enter/exit · F loot</p>
+      <p>Third person · WASD move · Mouse aim · Space jump · Shift sprint</p>
+      <p>B wall · R remove · Q swap weapon · 1–3 use supplies · E doors · F loot</p>
       <p id="seedLine"></p>
       <p id="statsLine"></p>
       <button id="startButton" type="button">Enter World</button>
@@ -29,6 +28,11 @@
     </aside>
 
     <div id="interaction-prompt" class="interaction-prompt hidden" role="status"></div>
+
+    <div id="combat-hud" class="combat-hud hidden" aria-live="polite">
+      <div class="crosshair" aria-hidden="true"></div>
+      <p class="combat-hint">Aim the crosshair at infected and <strong>left-click</strong> to shoot. You need ammo.</p>
+    </div>
 
     <canvas id="game"></canvas>
     <script type="module" src="/src/main.js"></script>

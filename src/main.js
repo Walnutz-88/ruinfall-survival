@@ -14,7 +14,14 @@ const HALF_WORLD = WORLD_SIZE / 2;
 const PLAYER_HEIGHT = 1.75;
 const GRAVITY = 24;
 const BUILD_RANGE = 9;
-const CITY_RADIUS = 140;
+const CITY_RADIUS = 165;
+/** Horizontal capsule radius for player vs building AABBs. */
+const PLAYER_RADIUS = 0.38;
+const BLOCK_SPACING = 20;
+const ROAD_HALF_WIDTH = 5.5;
+const THIRD_CAM_DISTANCE = 5.6;
+const THIRD_CAM_HEIGHT = 2.05;
+const THIRD_CAM_LOOK_Y = 1.28;
 const DAY_SECONDS = 120;
 const TARGET_DAYS = 14;
 const LOOT_PICKUP_RADIUS = 2.85;
@@ -58,9 +65,18 @@ const baseGroup = new THREE.Group();
 const lootGroup = new THREE.Group();
 const cityGroup = new THREE.Group();
 
-/** First-person weapon rigs parented to the camera (cheap “AAA” readability). */
+/** Third-person survivor mesh (simple rig, no skeleton). */
+let playerAvatar;
+
+/** First-person weapon rigs (hidden in third person; kept for optional future toggle). */
 let weaponViewPistol;
 let weaponViewRifle;
+
+const _eulerMove = new THREE.Euler(0, 0, 0, "YXZ");
+const _quatMove = new THREE.Quaternion();
+const _vecForward = new THREE.Vector3();
+const _vecRight = new THREE.Vector3();
+const _vecPivot = new THREE.Vector3();
 
 const keys = { w: false, a: false, s: false, d: false, shift: false };
 const player = {
@@ -95,7 +111,11 @@ const game = {
   over: false,
   won: false,
   /** Populated at city generation time; each entry is one enterable shell + interior. */
-  enterableBuildings: []
+  enterableBuildings: [],
+  /** Outdoor building collision volumes (axis-aligned boxes in world space). */
+  staticColliders: [],
+  /** Base-building walls the player placed; each entry `{ mesh, box }`. */
+  placedWallColliders: []
 };
 
 const ui = {
@@ -107,7 +127,8 @@ const ui = {
   invWater: document.getElementById("inv-water"),
   invMedkit: document.getElementById("inv-medkit"),
   invAmmo: document.getElementById("inv-ammo"),
-  invWeapon: document.getElementById("inv-weapon")
+  invWeapon: document.getElementById("inv-weapon"),
+  combatHud: document.getElementById("combat-hud")
 };
 
 init();
@@ -163,12 +184,16 @@ function init() {
   buildWeaponViewModels();
   camera.add(weaponViewPistol, weaponViewRifle);
 
+  buildPlayerAvatar();
+  scene.add(playerAvatar);
+
   generateWorld(game.seed);
-  spawnZombies(40);
+  spawnZombies(72);
   hookInput();
   updateUI();
   updateInventoryPanel();
   hideInteractionPrompt();
+  playerAvatar.position.copy(player.position);
 
   ui.startButton.addEventListener("click", () => {
     renderer.domElement.requestPointerLock();
@@ -256,9 +281,8 @@ function buildWeaponViewModels() {
 
 function syncWeaponViewModels() {
   if (!weaponViewPistol || !weaponViewRifle) return;
-  const active = game.started && !game.over;
-  weaponViewPistol.visible = active && player.weapon === "pistol";
-  weaponViewRifle.visible = active && player.hasRifle && player.weapon === "rifle";
+  weaponViewPistol.visible = false;
+  weaponViewRifle.visible = false;
 }
 
 function buildViewModelPistol() {
@@ -356,6 +380,134 @@ function disposeLootObject(root) {
   });
 }
 
+function disposeGroupMeshes(group) {
+  while (group.children.length) {
+    const ch = group.children[0];
+    group.remove(ch);
+    ch.traverse((obj) => {
+      if (obj.isMesh) {
+        obj.geometry?.dispose();
+        const mat = obj.material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat?.dispose();
+      }
+    });
+  }
+}
+
+/** Push one physics box for outdoor collisions (called when city meshes are finalized). */
+function registerStaticColliderFromMesh(mesh) {
+  mesh.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(mesh);
+  game.staticColliders.push(box);
+}
+
+function buildPlayerAvatar() {
+  playerAvatar = new THREE.Group();
+  const cloth = new THREE.MeshStandardMaterial({
+    color: 0x3d4f6a,
+    roughness: 0.88,
+    metalness: 0.05,
+    envMapIntensity: 0.45
+  });
+  const skin = new THREE.MeshStandardMaterial({
+    color: 0xc9a88c,
+    roughness: 0.78,
+    metalness: 0.02,
+    envMapIntensity: 0.35
+  });
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.38, 0.72, 10), cloth);
+  torso.position.y = 0.92;
+  torso.castShadow = true;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 14, 12), skin);
+  head.position.y = 1.42;
+  head.castShadow = true;
+  const pack = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.45, 0.22), cloth);
+  pack.position.set(-0.28, 1.05, -0.12);
+  pack.castShadow = true;
+  const gun = new THREE.Mesh(
+    new THREE.BoxGeometry(0.55, 0.08, 0.12),
+    new THREE.MeshStandardMaterial({ color: 0x2a2d30, roughness: 0.4, metalness: 0.6, envMapIntensity: 0.8 })
+  );
+  gun.position.set(0.22, 1.05, 0.18);
+  gun.rotation.y = 0.15;
+  gun.castShadow = true;
+  playerAvatar.add(torso, head, pack, gun);
+}
+
+/**
+ * Push a horizontal cylinder out of an AABB footprint (XZ). Multiple passes reduce corner snagging.
+ */
+function resolveCircleAabb(px, pz, r, b) {
+  const closestX = THREE.MathUtils.clamp(px, b.min.x, b.max.x);
+  const closestZ = THREE.MathUtils.clamp(pz, b.min.z, b.max.z);
+  let dx = px - closestX;
+  let dz = pz - closestZ;
+  const d2 = dx * dx + dz * dz;
+  if (d2 >= r * r) return { x: px, z: pz };
+  if (d2 < 1e-10) {
+    const penL = px - b.min.x;
+    const penR = b.max.x - px;
+    const penB = pz - b.min.z;
+    const penF = b.max.z - pz;
+    const m = Math.min(penL, penR, penB, penF);
+    if (m === penL) return { x: b.min.x - r * 0.98, z: pz };
+    if (m === penR) return { x: b.max.x + r * 0.98, z: pz };
+    if (m === penB) return { x: px, z: b.min.z - r * 0.98 };
+    return { x: px, z: b.max.z + r * 0.98 };
+  }
+  const d = Math.sqrt(d2);
+  const push = (r - d) / d;
+  return { x: px + dx * push, z: pz + dz * push };
+}
+
+function resolvePlayerHorizontalCollisions() {
+  const r = PLAYER_RADIUS;
+  let px = player.position.x;
+  let pz = player.position.z;
+  const list =
+    player.interiorIndex !== null
+      ? game.enterableBuildings[player.interiorIndex]?.interiorWallColliders ?? []
+      : [...game.staticColliders, ...game.placedWallColliders.map((e) => e.box)];
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (const box of list) {
+      const res = resolveCircleAabb(px, pz, r, box);
+      px = res.x;
+      pz = res.z;
+    }
+  }
+  player.position.x = px;
+  player.position.z = pz;
+}
+
+/** Camera sits behind the survivor and orbits slightly with pitch for readability. */
+function updateThirdPersonCamera() {
+  _eulerMove.set(player.pitch, player.yaw, 0, "YXZ");
+  _quatMove.setFromEuler(_eulerMove);
+  _vecForward.set(0, 0, -1).applyQuaternion(_quatMove);
+  _vecForward.y = 0;
+  if (_vecForward.lengthSq() < 1e-6) _vecForward.set(0, 0, -1);
+  _vecForward.normalize();
+  _vecRight.crossVectors(_vecForward, new THREE.Vector3(0, 1, 0)).normalize();
+
+  _vecPivot.copy(player.position);
+  _vecPivot.y += THIRD_CAM_LOOK_Y;
+
+  const cosP = Math.cos(player.pitch * 0.55);
+  const sinP = Math.sin(player.pitch * 0.55);
+  const back = THIRD_CAM_DISTANCE * cosP;
+  const lift = THIRD_CAM_HEIGHT + sinP * THIRD_CAM_DISTANCE * 0.35;
+
+  camera.position.copy(player.position);
+  camera.position.addScaledVector(_vecForward, -back);
+  camera.position.y += lift;
+
+  const groundCam = sampleTerrainHeight(camera.position.x, camera.position.z) + 1.6;
+  if (camera.position.y < groundCam) camera.position.y = groundCam;
+
+  camera.lookAt(_vecPivot);
+}
+
 /** Heavier visual pipeline: bloom + correct output transform. Tune bloom for "dirty lens" city haze. */
 function setupPostProcess() {
   composer = new EffectComposer(renderer);
@@ -366,6 +518,10 @@ function setupPostProcess() {
 }
 
 function generateWorld(seed) {
+  disposeGroupMeshes(cityGroup);
+  game.enterableBuildings.length = 0;
+  game.staticColliders.length = 0;
+
   const terrainGeo = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, WORLD_SEGMENTS, WORLD_SEGMENTS);
   terrainGeo.rotateX(-Math.PI / 2);
   terrainHeights = [];
@@ -410,12 +566,14 @@ function makeSkydome() {
   scene.add(dome);
 }
 
-/** Streets and a mall anchor; returns the mall mesh for interior generation. */
+/**
+ * Manhattan-style dense grid: many narrow asphalt strips on a fixed block spacing.
+ */
 function buildRoadNetwork() {
   const asphalt = makeTiledTexture([42, 44, 48], [64, 66, 72], 256, 0.14);
   asphalt.wrapS = THREE.RepeatWrapping;
   asphalt.wrapT = THREE.RepeatWrapping;
-  asphalt.repeat.set(12, 48);
+  asphalt.repeat.set(28, 72);
   const roadMat = new THREE.MeshStandardMaterial({
     map: asphalt,
     roughness: 0.94,
@@ -423,20 +581,22 @@ function buildRoadNetwork() {
     envMapIntensity: 0.25
   });
 
-  const roadWidth = 16;
-  for (let i = -2; i <= 2; i += 1) {
-    const x = i * 52;
-    const y = sampleTerrainHeight(x, 0) + 0.06;
-    const road = new THREE.Mesh(new THREE.PlaneGeometry(roadWidth, CITY_RADIUS * 2.05), roadMat);
+  const strip = ROAD_HALF_WIDTH * 2;
+  const span = CITY_RADIUS * 2.25;
+  const gridN = Math.ceil(CITY_RADIUS / BLOCK_SPACING) + 2;
+  for (let i = -gridN; i <= gridN; i += 1) {
+    const x = i * BLOCK_SPACING;
+    const y = sampleTerrainHeight(x, 0) + 0.05;
+    const road = new THREE.Mesh(new THREE.PlaneGeometry(strip, span), roadMat);
     road.rotation.x = -Math.PI / 2;
     road.position.set(x, y, 0);
     road.receiveShadow = true;
     cityGroup.add(road);
   }
-  for (let i = -2; i <= 2; i += 1) {
-    const z = i * 52;
-    const y = sampleTerrainHeight(0, z) + 0.06;
-    const road = new THREE.Mesh(new THREE.PlaneGeometry(CITY_RADIUS * 2.05, roadWidth), roadMat);
+  for (let i = -gridN; i <= gridN; i += 1) {
+    const z = i * BLOCK_SPACING;
+    const y = sampleTerrainHeight(0, z) + 0.05;
+    const road = new THREE.Mesh(new THREE.PlaneGeometry(span, strip), roadMat);
     road.rotation.x = -Math.PI / 2;
     road.position.set(0, y, z);
     road.receiveShadow = true;
@@ -453,18 +613,19 @@ function buildRoadNetwork() {
     metalness: 0.06,
     envMapIntensity: 0.45
   });
-  const mall = new THREE.Mesh(new THREE.BoxGeometry(68, 14, 38), mallMat);
-  mall.position.set(-18, sampleTerrainHeight(-18, 12) + 7, 12);
+  const mall = new THREE.Mesh(new THREE.BoxGeometry(72, 16, 42), mallMat);
+  mall.position.set(-18, sampleTerrainHeight(-18, 12) + 8, 12);
   mall.castShadow = true;
   mall.receiveShadow = true;
   cityGroup.add(mall);
+  registerStaticColliderFromMesh(mall);
 
   createMallInterior(mall, game.seed);
   return mall;
 }
 
 /**
- * Procedural city blocks: some are solid ruins, others are enterable shells with interior volumes.
+ * Dense NYC-style blocks: tall narrow towers on a tight grid; some lots are enterable interiors.
  * @param {THREE.Mesh} mallMesh - used only to avoid overlapping footprints with the mall.
  */
 function buildCityRuins(seed, mallMesh) {
@@ -472,9 +633,6 @@ function buildCityRuins(seed, mallMesh) {
   const concrete = makeTiledTexture([95, 95, 96], [145, 145, 150], 256, 0.2);
   concrete.wrapS = THREE.RepeatWrapping;
   concrete.wrapT = THREE.RepeatWrapping;
-  const windowTex = makeWindowTexture();
-  windowTex.wrapS = THREE.RepeatWrapping;
-  windowTex.wrapT = THREE.RepeatWrapping;
 
   const wallMat = new THREE.MeshStandardMaterial({
     map: concrete,
@@ -482,37 +640,30 @@ function buildCityRuins(seed, mallMesh) {
     metalness: 0.08,
     envMapIntensity: 0.5
   });
-  const glassMat = new THREE.MeshStandardMaterial({
-    map: windowTex,
-    roughness: 0.32,
-    metalness: 0.12,
-    transparent: true,
-    opacity: 0.58,
-    envMapIntensity: 0.85
-  });
 
   const mallCx = mallMesh.position.x;
   const mallCz = mallMesh.position.z;
+  const gridHalf = Math.floor(CITY_RADIUS / BLOCK_SPACING);
 
-  for (let bx = -2; bx <= 2; bx += 1) {
-    for (let bz = -2; bz <= 2; bz += 1) {
-      const cx = bx * 52 + (rng() - 0.5) * 10;
-      const cz = bz * 52 + (rng() - 0.5) * 10;
-      if (Math.hypot(cx, cz) > CITY_RADIUS) continue;
-      if (Math.abs(cx - mallCx) < 42 && Math.abs(cz - mallCz) < 32) continue;
+  for (let bx = -gridHalf; bx < gridHalf; bx += 1) {
+    for (let bz = -gridHalf; bz < gridHalf; bz += 1) {
+      const cx = (bx + 0.5) * BLOCK_SPACING + (rng() - 0.5) * 3.5;
+      const cz = (bz + 0.5) * BLOCK_SPACING + (rng() - 0.5) * 3.5;
+      if (Math.hypot(cx, cz) > CITY_RADIUS - 8) continue;
+      if (Math.abs(cx - mallCx) < 46 && Math.abs(cz - mallCz) < 36) continue;
 
       const y = sampleTerrainHeight(cx, cz);
-      const asEnterable = rng() < 0.4;
+      const asEnterable = rng() < 0.3;
 
       if (asEnterable) {
         createEnterableBuilding(cx, cz, y, rng, wallMat);
         continue;
       }
 
-      const floors = 2 + Math.floor(rng() * 6);
-      const width = 16 + rng() * 16;
-      const depth = 16 + rng() * 16;
-      const floorHeight = 3.2;
+      const floors = 5 + Math.floor(rng() * 16);
+      const width = 8 + rng() * 7;
+      const depth = 8 + rng() * 7;
+      const floorHeight = 3.05;
       const totalHeight = floors * floorHeight;
 
       const shell = new THREE.Mesh(new THREE.BoxGeometry(width, totalHeight, depth), wallMat);
@@ -520,25 +671,23 @@ function buildCityRuins(seed, mallMesh) {
       shell.castShadow = true;
       shell.receiveShadow = true;
       cityGroup.add(shell);
+      registerStaticColliderFromMesh(shell);
 
-      const missingCount = 1 + Math.floor(rng() * 3);
+      const missingCount = 1 + Math.floor(rng() * 2);
       for (let i = 0; i < missingCount; i += 1) {
         const slab = new THREE.Mesh(
-          new THREE.BoxGeometry(width * (0.35 + rng() * 0.45), floorHeight * (1 + rng() * 1.6), depth * (0.3 + rng() * 0.4)),
+          new THREE.BoxGeometry(width * (0.32 + rng() * 0.42), floorHeight * (1 + rng() * 1.5), depth * (0.28 + rng() * 0.38)),
           new THREE.MeshStandardMaterial({ color: 0x282a2f, roughness: 0.98 })
         );
         slab.position.set(
-          cx + (rng() - 0.5) * width * 0.45,
+          cx + (rng() - 0.5) * width * 0.42,
           y + totalHeight * (0.28 + rng() * 0.55),
-          cz + (rng() - 0.5) * depth * 0.45
+          cz + (rng() - 0.5) * depth * 0.42
         );
         slab.rotation.y = rng() * Math.PI * 2;
         cityGroup.add(slab);
+        registerStaticColliderFromMesh(slab);
       }
-
-      const facade = new THREE.Mesh(new THREE.PlaneGeometry(width * 0.9, totalHeight * 0.9), glassMat);
-      facade.position.set(cx, y + totalHeight / 2, cz + depth / 2 + 0.03);
-      cityGroup.add(facade);
     }
   }
 }
@@ -556,6 +705,17 @@ function createEnterableBuilding(cx, cz, baseTerrainY, rng, wallMat) {
   const halfW = innerW / 2;
   const halfD = innerD / 2;
   const floorY = baseTerrainY + 0.1;
+  const interiorWallColliders = [];
+
+  const pushInteriorWall = (geom, px, py, pz) => {
+    const m = new THREE.Mesh(geom, wallMat);
+    m.position.set(px, py, pz);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    cityGroup.add(m);
+    m.updateMatrixWorld(true);
+    interiorWallColliders.push(new THREE.Box3().setFromObject(m));
+  };
 
   const floorMap = makeWoodTileTexture();
   floorMap.wrapS = THREE.RepeatWrapping;
@@ -574,20 +734,12 @@ function createEnterableBuilding(cx, cz, baseTerrainY, rng, wallMat) {
   floor.receiveShadow = true;
   cityGroup.add(floor);
 
-  const addWall = (geom, px, py, pz) => {
-    const m = new THREE.Mesh(geom, wallMat);
-    m.position.set(px, py, pz);
-    m.castShadow = true;
-    m.receiveShadow = true;
-    cityGroup.add(m);
-  };
-
-  addWall(new THREE.BoxGeometry(innerW, wallH, t), cx, floorY + wallH / 2, cz - halfD);
+  pushInteriorWall(new THREE.BoxGeometry(innerW, wallH, t), cx, floorY + wallH / 2, cz - halfD);
   const southLeftW = (innerW - doorW) / 2;
-  addWall(new THREE.BoxGeometry(southLeftW, wallH, t), cx - halfW + southLeftW / 2, floorY + wallH / 2, cz + halfD);
-  addWall(new THREE.BoxGeometry(southLeftW, wallH, t), cx + halfW - southLeftW / 2, floorY + wallH / 2, cz + halfD);
-  addWall(new THREE.BoxGeometry(t, wallH, innerD), cx - halfW, floorY + wallH / 2, cz);
-  addWall(new THREE.BoxGeometry(t, wallH, innerD), cx + halfW, floorY + wallH / 2, cz);
+  pushInteriorWall(new THREE.BoxGeometry(southLeftW, wallH, t), cx - halfW + southLeftW / 2, floorY + wallH / 2, cz + halfD);
+  pushInteriorWall(new THREE.BoxGeometry(southLeftW, wallH, t), cx + halfW - southLeftW / 2, floorY + wallH / 2, cz + halfD);
+  pushInteriorWall(new THREE.BoxGeometry(t, wallH, innerD), cx - halfW, floorY + wallH / 2, cz);
+  pushInteriorWall(new THREE.BoxGeometry(t, wallH, innerD), cx + halfW, floorY + wallH / 2, cz);
 
   const ceiling = new THREE.Mesh(
     new THREE.BoxGeometry(innerW * 0.92, 0.35, innerD * 0.92),
@@ -628,6 +780,7 @@ function createEnterableBuilding(cx, cz, baseTerrainY, rng, wallMat) {
     col.castShadow = true;
     col.receiveShadow = true;
     cityGroup.add(col);
+    registerStaticColliderFromMesh(col);
   }
 
   const enterPromptWorld = new THREE.Vector3(
@@ -652,7 +805,8 @@ function createEnterableBuilding(cx, cz, baseTerrainY, rng, wallMat) {
     enterPromptWorld,
     exitPromptWorld,
     interiorSpawnWorld,
-    exitSpawnWorld
+    exitSpawnWorld,
+    interiorWallColliders
   });
 }
 
@@ -663,13 +817,14 @@ function createMallInterior(mallMesh, seed) {
   const rng = seededRandom(seed + 9001);
   const mx = mallMesh.position.x;
   const mz = mallMesh.position.z;
-  const floorWorldY = mallMesh.position.y - 7 + 0.14;
+  const floorWorldY = mallMesh.position.y - 8 + 0.14;
   const innerW = 50;
   const innerD = 34;
   const wallH = 5.2;
   const halfW = innerW / 2;
   const halfD = innerD / 2;
   const t = 0.35;
+  const interiorWallColliders = [];
 
   const tile = makePolishedConcreteTexture();
   tile.wrapS = THREE.RepeatWrapping;
@@ -695,22 +850,24 @@ function createMallInterior(mallMesh, seed) {
     envMapIntensity: 0.4
   });
 
-  const addWall = (w, h, d, px, py, pz) => {
+  const pushInteriorWall = (w, h, d, px, py, pz) => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), innerWall);
     m.position.set(px, py, pz);
     m.castShadow = true;
     m.receiveShadow = true;
     cityGroup.add(m);
+    m.updateMatrixWorld(true);
+    interiorWallColliders.push(new THREE.Box3().setFromObject(m));
   };
 
   // Main entrance on +Z (street side) to match exterior prompts and smaller enterable lots.
   const doorW = 6.0;
   const southLeft = (innerW - doorW) / 2;
-  addWall(southLeft, wallH, t, mx - halfW + southLeft / 2, floorWorldY + wallH / 2, mz + halfD);
-  addWall(southLeft, wallH, t, mx + halfW - southLeft / 2, floorWorldY + wallH / 2, mz + halfD);
-  addWall(innerW, wallH, t, mx, floorWorldY + wallH / 2, mz - halfD);
-  addWall(t, wallH, innerD, mx - halfW, floorWorldY + wallH / 2, mz);
-  addWall(t, wallH, innerD, mx + halfW, floorWorldY + wallH / 2, mz);
+  pushInteriorWall(southLeft, wallH, t, mx - halfW + southLeft / 2, floorWorldY + wallH / 2, mz + halfD);
+  pushInteriorWall(southLeft, wallH, t, mx + halfW - southLeft / 2, floorWorldY + wallH / 2, mz + halfD);
+  pushInteriorWall(innerW, wallH, t, mx, floorWorldY + wallH / 2, mz - halfD);
+  pushInteriorWall(t, wallH, innerD, mx - halfW, floorWorldY + wallH / 2, mz);
+  pushInteriorWall(t, wallH, innerD, mx + halfW, floorWorldY + wallH / 2, mz);
 
   for (let gx = -1; gx <= 1; gx += 1) {
     for (let gz = -1; gz <= 1; gz += 1) {
@@ -720,6 +877,8 @@ function createMallInterior(mallMesh, seed) {
       pillar.castShadow = true;
       pillar.receiveShadow = true;
       cityGroup.add(pillar);
+      pillar.updateMatrixWorld(true);
+      interiorWallColliders.push(new THREE.Box3().setFromObject(pillar));
     }
   }
 
@@ -762,7 +921,8 @@ function createMallInterior(mallMesh, seed) {
     enterPromptWorld,
     exitPromptWorld,
     interiorSpawnWorld,
-    exitSpawnWorld
+    exitSpawnWorld,
+    interiorWallColliders
   });
 }
 
@@ -854,34 +1014,157 @@ function addLootPickup(position, type, colorHex) {
   game.loot.push({ mesh: root, type, picked: false, label: LOOT_LABELS[type] });
 }
 
-function spawnZombies(count) {
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x70806a, roughness: 0.94, envMapIntensity: 0.25 });
-  const eyeMat = new THREE.MeshBasicMaterial({ color: 0xff4d4d });
+const ZOMBIE_KINDS = ["shambler", "runner", "brute", "crawler", "bloated", "stalker"];
 
-  for (let i = 0; i < count; i += 1) {
-    const group = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.35, 1.0, 4, 8), bodyMat);
-    const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.05), eyeMat);
-    const eyeR = new THREE.Mesh(new THREE.SphereGeometry(0.05), eyeMat);
-    eyeL.position.set(-0.1, 0.9, 0.24);
-    eyeR.position.set(0.1, 0.9, 0.24);
+/**
+ * Builds a distinct infected silhouette per archetype (stats + mesh hierarchy).
+ */
+function buildZombieVariant(kind, rng) {
+  const g = new THREE.Group();
+  const eyeMat = new THREE.MeshBasicMaterial({ color: 0xff2a2a });
+  const addEyes = (y, spread) => {
+    const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.045, 6, 6), eyeMat);
+    const eyeR = new THREE.Mesh(new THREE.SphereGeometry(0.045, 6, 6), eyeMat);
+    eyeL.position.set(-spread, y, 0.16);
+    eyeR.position.set(spread, y, 0.16);
+    g.add(eyeL, eyeR);
+  };
+
+  let hp = 90;
+  let speed = 0.85;
+  let damage = 8;
+  let feetY = 0.92;
+
+  const cloth = new THREE.MeshStandardMaterial({ color: 0x5c6d58, roughness: 0.93, envMapIntensity: 0.28 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x3d3832, roughness: 0.95, envMapIntensity: 0.22 });
+  const sick = new THREE.MeshStandardMaterial({ color: 0x7d6e62, roughness: 0.9, envMapIntensity: 0.25 });
+  const boil = new THREE.MeshStandardMaterial({ color: 0x6a4a4a, roughness: 0.88, envMapIntensity: 0.2 });
+
+  if (kind === "runner") {
+    hp = 52;
+    speed = 1.95 + rng() * 0.55;
+    damage = 6;
+    feetY = 0.86;
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.26, 0.78, 4, 8), cloth);
+    body.position.y = 0.82;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 10, 8), sick);
+    head.position.y = 1.48;
     body.castShadow = true;
-    group.add(body, eyeL, eyeR);
-
-    let x = (Math.random() - 0.5) * (WORLD_SIZE - 20);
-    let z = (Math.random() - 0.5) * (WORLD_SIZE - 20);
-    if (Math.hypot(x, z) > CITY_RADIUS * 0.95) {
-      x *= 0.5;
-      z *= 0.5;
+    head.castShadow = true;
+    g.add(body, head);
+    addEyes(1.52, 0.07);
+  } else if (kind === "brute") {
+    hp = 210;
+    speed = 0.52 + rng() * 0.22;
+    damage = 16;
+    feetY = 1.12;
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.5, 1.05, 4, 8), dark);
+    body.position.y = 1.05;
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.38, 0.44), dark);
+    head.position.y = 1.95;
+    const shoulderL = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 8), dark);
+    const shoulderR = shoulderL.clone();
+    shoulderL.position.set(-0.55, 1.45, 0);
+    shoulderR.position.set(0.55, 1.45, 0);
+    body.castShadow = true;
+    head.castShadow = true;
+    g.add(body, head, shoulderL, shoulderR);
+    addEyes(2.02, 0.1);
+  } else if (kind === "crawler") {
+    hp = 38;
+    speed = 1.15 + rng() * 0.45;
+    damage = 5;
+    feetY = 0.32;
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.22, 0.48), cloth);
+    torso.position.y = 0.32;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.19, 8, 8), sick);
+    head.position.set(0.38, 0.38, 0);
+    const legGeo = new THREE.BoxGeometry(0.12, 0.08, 0.22);
+    for (let i = 0; i < 4; i += 1) {
+      const leg = new THREE.Mesh(legGeo, dark);
+      const sx = i < 2 ? -1 : 1;
+      const sz = i % 2 === 0 ? -1 : 1;
+      leg.position.set(sx * 0.28, 0.12, sz * 0.22);
+      leg.castShadow = true;
+      g.add(leg);
     }
-    const y = sampleTerrainHeight(x, z) + 0.95;
-    group.position.set(x, y, z);
-    zombieGroup.add(group);
+    torso.castShadow = true;
+    head.castShadow = true;
+    g.add(torso, head);
+    addEyes(0.42, 0.06);
+  } else if (kind === "bloated") {
+    hp = 130;
+    speed = 0.58 + rng() * 0.18;
+    damage = 10;
+    feetY = 0.88;
+    const belly = new THREE.Mesh(new THREE.SphereGeometry(0.48, 12, 10), boil);
+    belly.scale.set(1.1, 0.95, 0.9);
+    belly.position.y = 0.75;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), sick);
+    head.position.y = 1.38;
+    belly.castShadow = true;
+    head.castShadow = true;
+    g.add(belly, head);
+    addEyes(1.42, 0.07);
+  } else if (kind === "stalker") {
+    hp = 72;
+    speed = 1.05 + rng() * 0.35;
+    damage = 9;
+    feetY = 1.02;
+    const spine = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.18, 1.65, 8), dark);
+    spine.position.y = 1.05;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.17, 10, 8), sick);
+    head.position.y = 1.92;
+    const armL = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.65, 0.1), cloth);
+    const armR = armL.clone();
+    armL.position.set(-0.28, 1.25, 0);
+    armR.position.set(0.28, 1.25, 0);
+    spine.castShadow = true;
+    head.castShadow = true;
+    g.add(spine, head, armL, armR);
+    addEyes(1.95, 0.06);
+  } else {
+    hp = 95;
+    speed = 0.72 + rng() * 0.38;
+    damage = 8;
+    feetY = 0.92;
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.34, 0.95, 4, 8), cloth);
+    body.position.y = 0.92;
+    body.castShadow = true;
+    g.add(body);
+    addEyes(1.38, 0.09);
+  }
+
+  g.traverse((ch) => {
+    if (ch.isMesh) ch.castShadow = true;
+  });
+  return { mesh: g, hp, speed, damage, feetYOffset: feetY, kind };
+}
+
+function spawnZombies(count) {
+  const rng = seededRandom(game.seed + 5555);
+  for (let i = 0; i < count; i += 1) {
+    const kind = ZOMBIE_KINDS[Math.floor(rng() * ZOMBIE_KINDS.length)];
+    const built = buildZombieVariant(kind, rng);
+
+    let x = (rng() - 0.5) * (CITY_RADIUS * 1.85);
+    let pz = (rng() - 0.5) * (CITY_RADIUS * 1.85);
+    if (Math.hypot(x, pz) > CITY_RADIUS * 0.92) {
+      x *= 0.55;
+      pz *= 0.55;
+    }
+    const py = sampleTerrainHeight(x, pz) + built.feetYOffset;
+    built.mesh.position.set(x, py, pz);
+    zombieGroup.add(built.mesh);
 
     game.zombies.push({
-      mesh: group,
-      speed: 0.8 + Math.random() * 0.95,
-      hp: 100
+      mesh: built.mesh,
+      speed: built.speed,
+      hp: built.hp,
+      maxHp: built.hp,
+      damage: built.damage,
+      feetYOffset: built.feetYOffset,
+      kind: built.kind
     });
   }
 }
@@ -890,6 +1173,8 @@ function hookInput() {
   document.addEventListener("pointerlockchange", () => {
     game.started = document.pointerLockElement === renderer.domElement;
     syncWeaponViewModels();
+    if (game.started) ui.combatHud?.classList.remove("hidden");
+    else ui.combatHud?.classList.add("hidden");
   });
 
   window.addEventListener("mousemove", (ev) => {
@@ -1062,6 +1347,8 @@ function placeWall() {
   wall.castShadow = true;
   wall.receiveShadow = true;
   baseGroup.add(wall);
+  wall.updateMatrixWorld(true);
+  game.placedWallColliders.push({ mesh: wall, box: new THREE.Box3().setFromObject(wall) });
 }
 
 function removeNearestWall() {
@@ -1075,6 +1362,8 @@ function removeNearestWall() {
     }
   }
   if (nearest && dist < 4.4) {
+    const idx = game.placedWallColliders.findIndex((e) => e.mesh === nearest);
+    if (idx >= 0) game.placedWallColliders.splice(idx, 1);
     baseGroup.remove(nearest);
     nearest.geometry.dispose();
     nearest.material.dispose();
@@ -1126,15 +1415,20 @@ function getZombieRoot(obj) {
 }
 
 function updatePlayer(dt) {
-  const speed = keys.shift ? 9.2 : 5.1;
-  const move = new THREE.Vector3();
-  const forward = new THREE.Vector3(Math.sin(player.yaw), 0, -Math.cos(player.yaw));
-  const right = new THREE.Vector3(-forward.z, 0, forward.x);
+  const speed = keys.shift ? 8.4 : 4.85;
+  _eulerMove.set(player.pitch, player.yaw, 0, "YXZ");
+  _quatMove.setFromEuler(_eulerMove);
+  _vecForward.set(0, 0, -1).applyQuaternion(_quatMove);
+  _vecForward.y = 0;
+  if (_vecForward.lengthSq() < 1e-8) _vecForward.set(0, 0, -1);
+  _vecForward.normalize();
+  _vecRight.crossVectors(_vecForward, new THREE.Vector3(0, 1, 0)).normalize();
 
-  if (keys.w) move.add(forward);
-  if (keys.s) move.sub(forward);
-  if (keys.d) move.add(right);
-  if (keys.a) move.sub(right);
+  const move = new THREE.Vector3();
+  if (keys.w) move.add(_vecForward);
+  if (keys.s) move.sub(_vecForward);
+  if (keys.d) move.add(_vecRight);
+  if (keys.a) move.sub(_vecRight);
   if (move.lengthSq() > 0) move.normalize().multiplyScalar(speed);
 
   player.velocity.x = move.x;
@@ -1167,10 +1461,16 @@ function updatePlayer(dt) {
     player.grounded = true;
   }
 
-  camera.position.copy(player.position);
-  camera.rotation.order = "YXZ";
-  camera.rotation.y = player.yaw;
-  camera.rotation.x = player.pitch;
+  if (player.interiorIndex === null) {
+    resolvePlayerHorizontalCollisions();
+  }
+
+  if (playerAvatar) {
+    playerAvatar.position.copy(player.position);
+    playerAvatar.rotation.y = player.yaw;
+  }
+
+  updateThirdPersonCamera();
 }
 
 function updateZombies(dt) {
@@ -1187,10 +1487,12 @@ function updateZombies(dt) {
       z.mesh.rotation.y = Math.atan2(dir.x, dir.z);
     }
 
-    p.y = sampleTerrainHeight(p.x, p.z) + 0.95;
+    const foot = z.feetYOffset ?? 0.92;
+    p.y = sampleTerrainHeight(p.x, p.z) + foot;
 
-    if (dist < 1.6 && player.attackCooldown <= 0) {
-      player.health = Math.max(0, player.health - 8);
+    const reach = z.kind === "brute" ? 2.05 : z.kind === "crawler" ? 1.15 : 1.58;
+    if (dist < reach && player.attackCooldown <= 0) {
+      player.health = Math.max(0, player.health - (z.damage ?? 8));
       player.attackCooldown = 0.65;
     }
   }
@@ -1227,6 +1529,7 @@ function updateUI() {
   ui.statsLine.textContent = `${objective} | HP ${player.health.toFixed(0)} | Hunger ${player.hunger.toFixed(0)} | Thirst ${player.thirst.toFixed(
     0
   )}`;
+  if (game.over) ui.combatHud?.classList.add("hidden");
 }
 
 function animate() {
@@ -1239,16 +1542,8 @@ function animate() {
     updateSurvival(dt);
   }
 
-  const t = clock.elapsedTime;
-  const sway = Math.sin(t * 5.5) * 0.028;
   player.weaponKick = THREE.MathUtils.lerp(player.weaponKick, 0, dt * 16);
   syncWeaponViewModels();
-  if (weaponViewPistol?.visible) {
-    weaponViewPistol.rotation.set(0.08 + player.weaponKick * 0.85, 0.18 + sway * 0.35, sway);
-  }
-  if (weaponViewRifle?.visible) {
-    weaponViewRifle.rotation.set(0.04 + player.weaponKick * 0.5, 0.14 + sway * 0.22, sway * 0.85);
-  }
 
   updateUI();
   updateInteractionPrompt();
