@@ -10,11 +10,26 @@
     <div id="ui">
       <h1>Ruinfall Survival</h1>
       <p>WASD move, Mouse look, Space jump, Shift sprint</p>
-      <p>Left Click: Place base wall, R: remove nearest wall</p>
+      <p>Left click fire · B wall · R remove · Q swap weapon</p>
+      <p>1 food · 2 water · 3 medkit · E enter/exit · F loot</p>
       <p id="seedLine"></p>
       <p id="statsLine"></p>
-      <button id="startButton">Enter World</button>
+      <button id="startButton" type="button">Enter World</button>
     </div>
+
+    <aside id="inventory-panel" aria-label="Inventory">
+      <h2>Inventory</h2>
+      <ul class="inv-list">
+        <li><span class="inv-name">Food</span> <span id="inv-food">0</span></li>
+        <li><span class="inv-name">Water</span> <span id="inv-water">0</span></li>
+        <li><span class="inv-name">Medkits</span> <span id="inv-medkit">0</span></li>
+        <li><span class="inv-name">Ammo</span> <span id="inv-ammo">0</span></li>
+        <li><span class="inv-name">Weapon</span> <span id="inv-weapon">Pistol</span></li>
+      </ul>
+    </aside>
+
+    <div id="interaction-prompt" class="interaction-prompt hidden" role="status"></div>
+
     <canvas id="game"></canvas>
     <script type="module" src="/src/main.js"></script>
   </body>
